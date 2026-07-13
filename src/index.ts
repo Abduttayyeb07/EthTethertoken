@@ -5,6 +5,7 @@ import {
   Contract,
   FetchRequest,
   JsonRpcProvider,
+  Network,
   WebSocketProvider,
   formatEther,
   isAddress,
@@ -152,7 +153,8 @@ class FallbackRpcProvider implements RpcProvider {
     let entry = this.providers.get(rpcUrl);
     if (!entry) {
       const provider = new JsonRpcProvider(new FetchRequest(rpcUrl), Number(CHAIN_ID), {
-        batchMaxCount: 1
+        batchMaxCount: 1,
+        staticNetwork: Network.from(Number(CHAIN_ID))
       });
       entry = new RateLimitedProvider(provider, this.minDelayMs);
       this.providers.set(rpcUrl, entry);
