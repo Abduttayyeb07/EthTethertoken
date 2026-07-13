@@ -1,0 +1,9 @@
+services:
+  usdt-monitor:
+    build: .
+    container_name: eth-usdt-telegram-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
