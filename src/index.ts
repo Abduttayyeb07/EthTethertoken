@@ -41,6 +41,7 @@ export type TransferAlert = {
   symbol: string;
   from: string;
   to: string;
+  txFrom?: string;
   transactionHash: string;
   blockNumber: number;
 };
@@ -93,6 +94,7 @@ type RpcProvider = {
   getBlockNumber(): Promise<number>;
   getBalance(address: string): Promise<bigint>;
   getLogs(filter: Parameters<JsonRpcProvider["getLogs"]>[0]): Promise<Log[]>;
+  getTransaction(hash: string): ReturnType<JsonRpcProvider["getTransaction"]>;
 };
 
 class RateLimitedProvider implements RpcProvider {
@@ -116,6 +118,11 @@ class RateLimitedProvider implements RpcProvider {
   async getLogs(filter: Parameters<JsonRpcProvider["getLogs"]>[0]): Promise<Log[]> {
     await this.waitForSlot();
     return this.provider.getLogs(filter);
+  }
+
+  async getTransaction(hash: string): ReturnType<JsonRpcProvider["getTransaction"]> {
+    await this.waitForSlot();
+    return this.provider.getTransaction(hash);
   }
 
   private async waitForSlot(): Promise<void> {
@@ -184,6 +191,10 @@ class FallbackRpcProvider implements RpcProvider {
     }
 
     throw new Error(`getLogs failed on all RPC endpoints:\n${errors.join("\n")}`);
+  }
+
+  async getTransaction(hash: string): ReturnType<JsonRpcProvider["getTransaction"]> {
+    return this.getOrCreate(this.primaryUrl).getTransaction(hash);
   }
 }
 
@@ -814,7 +825,7 @@ async function main(): Promise<void> {
         const parsed = usdt.interface.parseLog(log);
         if (!parsed) continue;
 
-        const alert = buildTransferAlert({
+        let alert = buildTransferAlert({
           log,
           parsedArgs: parsed.args,
           walletByAddress,
@@ -823,6 +834,7 @@ async function main(): Promise<void> {
           minAlertRawValue
         });
         if (!alert) continue;
+        alert = await enrichInflowAlertWithTxFrom(rateLimitedProvider, alert, rpcTimeoutMs);
         const alertKey = buildAlertKey(alert);
         if (deliveredAlertKeys.has(alertKey)) continue;
         deliveredAlertKeys.add(alertKey);
@@ -904,18 +916,45 @@ export function buildTransferAlert(input: {
 function buildTransferAlertMessage(alert: TransferAlert, prefix = ""): string {
   const txUrl = `https://etherscan.io/tx/${alert.transactionHash}`;
   const title = `${prefix}${alert.symbol} ${alert.direction}`;
+  const txFromLine =
+    alert.direction === "Inflow" && alert.txFrom
+      ? [`<b>Tx From:</b> <code>${escapeHtml(alert.txFrom)}</code>`]
+      : [];
 
   return [
     `<b>${escapeHtml(title)}</b>`,
     "",
     `<b>Wallet:</b> ${escapeHtml(alert.wallet.label)}`,
     `<b>Amount:</b> ${escapeHtml(alert.amount)} ${escapeHtml(alert.symbol)}`,
+    ...txFromLine,
     `<b>From:</b> <code>${escapeHtml(alert.from)}</code>`,
     `<b>To:</b> <code>${escapeHtml(alert.to)}</code>`,
     `<b>Tx:</b> <code>${escapeHtml(alert.transactionHash)}</code>`,
     `<b>Block:</b> ${alert.blockNumber}`,
     `<a href="${txUrl}">Open on Etherscan</a>`
   ].join("\n");
+}
+
+async function enrichInflowAlertWithTxFrom(
+  provider: Pick<RpcProvider, "getTransaction">,
+  alert: TransferAlert,
+  timeoutMs: number
+): Promise<TransferAlert> {
+  if (alert.direction !== "Inflow") return alert;
+
+  try {
+    const tx = await withTimeout(
+      provider.getTransaction(alert.transactionHash),
+      timeoutMs,
+      `transaction lookup timed out for ${alert.transactionHash}`
+    );
+    return tx?.from ? { ...alert, txFrom: tx.from } : alert;
+  } catch (error) {
+    console.warn(
+      `Could not fetch tx.from for ${alert.transactionHash}: ${formatError(error)}`
+    );
+    return alert;
+  }
 }
 
 export function parseTokenAmount(value: string, decimals: number): bigint {
@@ -1000,7 +1039,7 @@ async function verifyHistoricalRange(input: {
     const parsed = input.usdt.interface.parseLog(log);
     if (!parsed) continue;
 
-    const alert = buildTransferAlert({
+    let alert = buildTransferAlert({
       log,
       parsedArgs: parsed.args,
       walletByAddress: input.walletByAddress,
@@ -1009,6 +1048,7 @@ async function verifyHistoricalRange(input: {
       minAlertRawValue: input.minAlertRawValue
     });
     if (!alert) continue;
+    alert = await enrichInflowAlertWithTxFrom(input.provider, alert, input.rpcTimeoutMs);
 
     await sendTelegramBroadcast(
       input.telegramToken,
@@ -1085,7 +1125,7 @@ async function startWebSocketMonitor(input: {
         input.liveStats.wsDecoded += 1;
         input.liveStats.lastWsBlock = Math.max(input.liveStats.lastWsBlock, log.blockNumber);
 
-        const alert = buildTransferAlert({
+        let alert = buildTransferAlert({
           log,
           parsedArgs: parsed.args,
           walletByAddress: input.walletByAddress,
@@ -1094,6 +1134,7 @@ async function startWebSocketMonitor(input: {
           minAlertRawValue: input.minAlertRawValue
         });
         if (!alert) return;
+        alert = await enrichInflowAlertWithTxFrom(activeProvider, alert, input.telegramTimeoutMs);
         if (alert.direction === "Inflow" && !input.alertIncoming) return;
         if (alert.direction === "Outflow" && !input.alertOutgoing) return;
         const alertKey = buildAlertKey(alert);
@@ -1832,7 +1873,7 @@ async function sendRecentRealTransferAlerts(input: {
       const parsed = input.usdt.interface.parseLog(log);
       if (!parsed) continue;
 
-      const alert = buildTransferAlert({
+      let alert = buildTransferAlert({
         log,
         parsedArgs: parsed.args,
         walletByAddress: input.walletByAddress,
@@ -1841,6 +1882,7 @@ async function sendRecentRealTransferAlerts(input: {
         minAlertRawValue: input.minAlertRawValue
       });
       if (!alert) continue;
+      alert = await enrichInflowAlertWithTxFrom(input.provider, alert, 15_000);
 
       const walletKey = normalizeAddress(alert.wallet.address);
       const alreadySent = sentByWallet.get(walletKey) ?? 0;
