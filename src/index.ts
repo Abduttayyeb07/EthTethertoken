@@ -27,6 +27,7 @@ export const ERC20_ABI = [
 export type WalletConfig = {
   label: string;
   address: string;
+  group?: string;
 };
 
 type SavedState = {
@@ -325,22 +326,31 @@ function parseWatchedWallets(value: string): WalletConfig[] {
       const separatorIndex = entry.lastIndexOf("=");
       if (separatorIndex <= 0 || separatorIndex === entry.length - 1) {
         throw new Error(
-          "WATCHED_WALLETS entries must use Label=0xAddress format, separated by commas"
+          "WATCHED_WALLETS entries must use Label=0xAddress or Group:Label=0xAddress format, separated by commas"
         );
       }
 
-      const label = entry.slice(0, separatorIndex).trim();
+      const labelPart = entry.slice(0, separatorIndex).trim();
       const address = entry.slice(separatorIndex + 1).trim();
+      const groupSeparatorIndex = labelPart.indexOf(":");
+      const group =
+        groupSeparatorIndex > 0 ? labelPart.slice(0, groupSeparatorIndex).trim() : undefined;
+      const label =
+        groupSeparatorIndex > 0 ? labelPart.slice(groupSeparatorIndex + 1).trim() : labelPart;
 
       if (!label) {
         throw new Error("WATCHED_WALLETS contains an empty wallet label");
+      }
+
+      if (groupSeparatorIndex > 0 && !group) {
+        throw new Error("WATCHED_WALLETS contains an empty wallet group");
       }
 
       if (!isAddress(address)) {
         throw new Error(`WATCHED_WALLETS contains invalid address: ${address}`);
       }
 
-      return { label, address };
+      return { label, address, group };
     });
 
   if (wallets.length === 0) {
@@ -920,10 +930,14 @@ function buildTransferAlertMessage(alert: TransferAlert, prefix = ""): string {
     alert.direction === "Inflow" && alert.txFrom
       ? [`<b>Tx From:</b> <code>${escapeHtml(alert.txFrom)}</code>`]
       : [];
+  const groupLine = alert.wallet.group
+    ? [`<b>Group:</b> ${escapeHtml(alert.wallet.group)}`]
+    : [];
 
   return [
     `<b>${escapeHtml(title)}</b>`,
     "",
+    ...groupLine,
     `<b>Wallet:</b> ${escapeHtml(alert.wallet.label)}`,
     `<b>Amount:</b> ${escapeHtml(alert.amount)} ${escapeHtml(alert.symbol)}`,
     ...txFromLine,
@@ -1565,8 +1579,19 @@ async function handleBalancesCommand(input: {
 }): Promise<void> {
   try {
     const lines = ["<b>Wallet Balances</b>", ""];
+    const walletsByGroup = new Map<string, WalletConfig[]>();
 
     for (const wallet of input.watchedWallets) {
+      const group = wallet.group || "Wallets";
+      const groupWallets = walletsByGroup.get(group) ?? [];
+      groupWallets.push(wallet);
+      walletsByGroup.set(group, groupWallets);
+    }
+
+    for (const [group, wallets] of walletsByGroup) {
+      lines.push(`<b>${escapeHtml(group)}</b>`);
+
+      for (const wallet of wallets) {
       const [rawTokenBalance, rawEthBalance] = await Promise.all([
         input.usdt.balanceOf(wallet.address) as Promise<bigint>,
         input.provider.getBalance(wallet.address)
@@ -1579,6 +1604,7 @@ async function handleBalancesCommand(input: {
       lines.push(`${escapeHtml(input.symbol)}: ${escapeHtml(tokenBalance)} ${escapeHtml(input.symbol)}`);
       lines.push(`<code>${escapeHtml(wallet.address)}</code>`);
       lines.push("");
+      }
     }
 
     await safeSendTelegramMessage(
