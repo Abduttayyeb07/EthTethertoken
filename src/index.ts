@@ -265,6 +265,14 @@ function optionalBooleanEnv(name: string, fallback: boolean): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+function parseBalanceReportTimes(value: string): string[] {
+  const times = [...new Set(value.split(",").map((time) => time.trim()).filter(Boolean))];
+  if (times.length === 0 || times.some((time) => !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))) {
+    throw new Error("BALANCE_REPORT_TIMES must contain times in HH:MM format, separated by commas");
+  }
+  return times;
+}
+
 function getRpcUrls(): string[] {
   const multiValue = process.env.ETH_RPC_URLS?.trim();
   const singleValue = process.env.ETH_RPC_URL?.trim();
@@ -512,6 +520,11 @@ async function main(): Promise<void> {
     "TELEGRAM_HEALTH_UPDATE_INTERVAL_MS",
     3_600_000
   );
+  const balanceReportsEnabled = optionalBooleanEnv("BALANCE_REPORT_ENABLED", true);
+  const balanceReportTimes = parseBalanceReportTimes(
+    process.env.BALANCE_REPORT_TIMES?.trim() || "12:30,21:30"
+  );
+  const balanceReportTimezone = process.env.BALANCE_REPORT_TIMEZONE?.trim() || "Asia/Karachi";
   const rpcTimeoutMs = optionalNumberEnv("RPC_TIMEOUT_MS", 10_000);
   const rpcMinDelayMs = optionalNumberEnv("RPC_MIN_DELAY_MS", 400);
   const symbol = process.env.TOKEN_SYMBOL?.trim() || "USDT";
@@ -652,6 +665,25 @@ async function main(): Promise<void> {
 
   if (commandPoller) {
     console.log("Telegram commands enabled: /verify <block> [toBlock]");
+  }
+
+  if (balanceReportsEnabled) {
+    startBalanceReportScheduler({
+      provider: rateLimitedProvider,
+      usdt,
+      telegramToken,
+      telegramChatIds,
+      telegramTimeoutMs,
+      telegramRetries,
+      watchedWallets,
+      symbol,
+      decimals,
+      times: balanceReportTimes,
+      timezone: balanceReportTimezone
+    });
+    console.log(
+      `Automatic balance reports enabled: ${balanceReportTimes.join(", ")} (${balanceReportTimezone})`
+    );
   }
 
   if (alertOnStartup) {
@@ -1625,6 +1657,65 @@ async function handleBalancesCommand(input: {
       "balances command failed"
     );
   }
+}
+
+function startBalanceReportScheduler(input: {
+  provider: RpcProvider;
+  usdt: Contract;
+  telegramToken: string;
+  telegramChatIds: string[];
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  watchedWallets: WalletConfig[];
+  symbol: string;
+  decimals: number;
+  times: string[];
+  timezone: string;
+}): NodeJS.Timeout {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: input.timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  let lastSentKey = "";
+
+  const checkSchedule = () => {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date()).map((part) => [part.type, part.value])
+    );
+    const date = `${parts.year}-${parts.month}-${parts.day}`;
+    const time = `${parts.hour}:${parts.minute}`;
+    const scheduleKey = `${date} ${time}`;
+
+    if (!input.times.includes(time) || lastSentKey === scheduleKey) return;
+    lastSentKey = scheduleKey;
+
+    void (async () => {
+      for (const chatId of input.telegramChatIds) {
+        await handleBalancesCommand({
+          provider: input.provider,
+          usdt: input.usdt,
+          telegramToken: input.telegramToken,
+          replyChatId: chatId,
+          telegramTimeoutMs: input.telegramTimeoutMs,
+          telegramRetries: input.telegramRetries,
+          watchedWallets: input.watchedWallets,
+          symbol: input.symbol,
+          decimals: input.decimals
+        });
+      }
+      console.log(`Automatic balance report sent for ${scheduleKey} (${input.timezone})`);
+    })().catch((error) => {
+      console.warn(`Automatic balance report failed for ${scheduleKey}: ${formatError(error)}`);
+    });
+  };
+
+  checkSchedule();
+  return setInterval(checkSchedule, 20_000);
 }
 
 async function handleStatusCommand(input: {
