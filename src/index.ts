@@ -13,6 +13,7 @@ import {
 } from "ethers";
 
 export const USDT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+export const USDC_ADDRESS = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CHAIN_ID = 1n;
@@ -530,6 +531,9 @@ async function main(): Promise<void> {
   const symbol = process.env.TOKEN_SYMBOL?.trim() || "USDT";
   const decimals = optionalNumberEnv("TOKEN_DECIMALS", 6);
   const minAlertRawValue = parseTokenAmount(process.env.MIN_ALERT_AMOUNT?.trim() || "1", decimals);
+  const usdcSymbol = "USDC";
+  const usdcDecimals = 6;
+  const usdcMinAlertRawValue = parseTokenAmount(process.env.MIN_ALERT_AMOUNT?.trim() || "1", usdcDecimals);
   const indexedApi = getIndexedApiConfig();
   const pollIntervalMs = optionalNumberEnv("POLL_INTERVAL_MS", 10_000);
   const confirmations = optionalNumberEnv("CONFIRMATIONS", 1);
@@ -564,15 +568,16 @@ async function main(): Promise<void> {
     throw new Error("At least one of ALERT_INCOMING or ALERT_OUTGOING must be true");
   }
 
-  console.log("Starting ETH USDT monitor...");
+  console.log("Starting ETH USDT + USDC monitor...");
   console.log(`Configured wallets: ${watchedWallets.map((wallet) => wallet.label).join(", ")}`);
   console.log(`Trying ${rpcUrls.length} RPC endpoint(s)`);
 
   const { provider, rpcUrl } = await connectProvider(rpcUrls, rpcTimeoutMs);
   const rateLimitedProvider = new FallbackRpcProvider(rpcUrls, rpcUrl, provider, rpcMinDelayMs);
-
   const usdt = new Contract(USDT_ADDRESS, ERC20_ABI, provider);
-  console.log(`Connected to ETH mainnet. Using token metadata: ${symbol}, decimals=${decimals}`);
+  const usdc = new Contract(USDC_ADDRESS, ERC20_ABI, provider);
+
+  console.log(`Connected to ETH mainnet. Monitoring ${symbol} and ${usdcSymbol}, decimals=6`);
 
   const walletByAddress = new Map(
     watchedWallets.map((wallet) => [normalizeAddress(wallet.address), wallet])
@@ -612,6 +617,7 @@ async function main(): Promise<void> {
   if (useWebSocket) {
     console.log(`WebSocket live endpoint(s): ${wsUrls.join(", ")}`);
     console.log(`Will subscribe: all ${symbol} Transfer events on ${USDT_ADDRESS}`);
+    console.log(`Will subscribe: all ${usdcSymbol} Transfer events on ${USDC_ADDRESS}`);
     console.log(
       `Will filter locally for wallets: ${watchedWallets
         .map((wallet) => `${wallet.label}=${wallet.address}`)
@@ -688,7 +694,7 @@ async function main(): Promise<void> {
 
   if (alertOnStartup) {
     const startupMessage = [
-      "<b>ETH USDT monitor started</b>",
+      "<b>ETH USDT + USDC monitor started</b>",
       "",
       `<b>Token:</b> ${escapeHtml(symbol)}`,
       `<b>RPC:</b> <code>${escapeHtml(rpcUrl)}</code>`,
@@ -751,6 +757,7 @@ async function main(): Promise<void> {
     webSocketController = await startWebSocketMonitor({
       wsUrls,
       usdt,
+      tokenAddress: USDT_ADDRESS,
       telegramToken,
       telegramChatIds,
       telegramTimeoutMs,
@@ -760,6 +767,27 @@ async function main(): Promise<void> {
       symbol,
       decimals,
       minAlertRawValue,
+      alertIncoming,
+      alertOutgoing,
+      logDecodedSummary: logWebSocketDecodedSummary,
+      decodedSummaryIntervalMs: webSocketDecodedSummaryIntervalMs,
+      deliveredAlertKeys,
+      liveStats
+    });
+
+    await startWebSocketMonitor({
+      wsUrls,
+      usdt: usdc,
+      tokenAddress: USDC_ADDRESS,
+      telegramToken,
+      telegramChatIds,
+      telegramTimeoutMs,
+      telegramRetries,
+      walletByAddress,
+      walletTopics,
+      symbol: usdcSymbol,
+      decimals: usdcDecimals,
+      minAlertRawValue: usdcMinAlertRawValue,
       alertIncoming,
       alertOutgoing,
       logDecodedSummary: logWebSocketDecodedSummary,
@@ -825,6 +853,7 @@ async function main(): Promise<void> {
       let indexedFallbackAlerts: TransferAlert[] = [];
       try {
         logs = await fetchTransferLogs(rateLimitedProvider, fromBlock, toBlock, walletTopics, {
+          tokenAddress: USDT_ADDRESS,
           incoming: alertIncoming,
           outgoing: alertOutgoing,
           timeoutMs: rpcTimeoutMs
@@ -837,6 +866,7 @@ async function main(): Promise<void> {
         );
         indexedFallbackAlerts = await fetchIndexedTransferAlerts({
           indexedApi,
+          tokenAddress: USDT_ADDRESS,
           wallets: watchedWallets,
           walletByAddress,
           fromBlock,
@@ -913,6 +943,103 @@ async function main(): Promise<void> {
         liveStats.deliveredAlerts += 1;
         console.log(
           `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
+        );
+      }
+
+      let usdcLogs: Log[] = [];
+      let usdcIndexedFallbackAlerts: TransferAlert[] = [];
+      try {
+        usdcLogs = await fetchTransferLogs(rateLimitedProvider, fromBlock, toBlock, walletTopics, {
+          tokenAddress: USDC_ADDRESS,
+          incoming: alertIncoming,
+          outgoing: alertOutgoing,
+          timeoutMs: rpcTimeoutMs
+        });
+      } catch (error) {
+        if (!indexedApi) throw error;
+
+        console.warn(
+          `USDC RPC log scan failed: ${formatError(error)}. Trying ${indexedApi.name} fallback for ${fromBlock}-${toBlock}.`
+        );
+        usdcIndexedFallbackAlerts = await fetchIndexedTransferAlerts({
+          indexedApi,
+          tokenAddress: USDC_ADDRESS,
+          wallets: watchedWallets,
+          walletByAddress,
+          fromBlock,
+          toBlock,
+          symbol: usdcSymbol,
+          decimals: usdcDecimals,
+          minAlertRawValue: usdcMinAlertRawValue,
+          alertIncoming,
+          alertOutgoing,
+          sort: "asc",
+          limitPerWallet: 100
+        });
+      }
+
+      if (logScanProgress) {
+        console.log(
+          `Live scan result: ${usdcLogs.length + usdcIndexedFallbackAlerts.length} matching ${usdcSymbol} transfer(s)`
+        );
+      }
+
+      const seenUsdcLogs = new Set<string>();
+      const seenUsdcAlerts = new Set<string>();
+      for (const log of usdcLogs) {
+        const logKey = `${log.transactionHash}:${log.index}`;
+        if (seenUsdcLogs.has(logKey)) continue;
+        seenUsdcLogs.add(logKey);
+
+        const parsed = usdc.interface.parseLog(log);
+        if (!parsed) continue;
+
+        let alert = buildTransferAlert({
+          log,
+          parsedArgs: parsed.args,
+          walletByAddress,
+          symbol: usdcSymbol,
+          decimals: usdcDecimals,
+          minAlertRawValue: usdcMinAlertRawValue
+        });
+        if (!alert) continue;
+        alert = await enrichInflowAlertWithTxFrom(rateLimitedProvider, alert, rpcTimeoutMs);
+        const alertKey = buildAlertKey(alert);
+        if (deliveredAlertKeys.has(alertKey)) continue;
+        deliveredAlertKeys.add(alertKey);
+        liveStats.httpMatched += 1;
+
+        await sendTelegramBroadcast(
+          telegramToken,
+          telegramChatIds,
+          buildTransferAlertMessage(alert),
+          telegramTimeoutMs,
+          telegramRetries
+        );
+        liveStats.deliveredAlerts += 1;
+        console.log(
+          `${alert.direction} ${alert.amount} ${usdcSymbol} for ${alert.wallet.label}: ${log.transactionHash}`
+        );
+      }
+
+      for (const alert of usdcIndexedFallbackAlerts) {
+        const alertKey = buildAlertKey(alert);
+        if (seenUsdcAlerts.has(alertKey)) continue;
+        seenUsdcAlerts.add(alertKey);
+        if (deliveredAlertKeys.has(alertKey)) continue;
+        deliveredAlertKeys.add(alertKey);
+        liveStats.httpMatched += 1;
+
+        await sendTelegramBroadcast(
+          telegramToken,
+          telegramChatIds,
+          buildTransferAlertMessage(alert),
+          telegramTimeoutMs,
+          telegramRetries
+        );
+        liveStats.deliveredAlerts += 1;
+        console.log(
+          `${alert.direction} ${alert.amount} ${usdcSymbol} for ${alert.wallet.label}: ${alert.transactionHash}`
         );
       }
 
@@ -1015,7 +1142,7 @@ export function parseTokenAmount(value: string, decimals: number): bigint {
 }
 
 export function buildAlertKey(alert: TransferAlert): string {
-  return `${alert.transactionHash}:${alert.direction}:${normalizeAddress(alert.wallet.address)}`;
+  return `${alert.symbol}:${alert.transactionHash}:${alert.direction}:${normalizeAddress(alert.wallet.address)}`;
 }
 
 function buildTestAlertMessage(wallet: WalletConfig, symbol: string): string {
@@ -1067,6 +1194,7 @@ async function verifyHistoricalRange(input: {
     input.toBlock,
     input.walletTopics,
     {
+      tokenAddress: USDT_ADDRESS,
       incoming: input.alertIncoming,
       outgoing: input.alertOutgoing,
       timeoutMs: input.rpcTimeoutMs
@@ -1119,6 +1247,7 @@ async function verifyHistoricalRange(input: {
 async function startWebSocketMonitor(input: {
   wsUrls: string[];
   usdt: Contract;
+  tokenAddress: string;
   telegramToken: string;
   telegramChatIds: string[];
   telegramTimeoutMs: number;
@@ -1152,12 +1281,12 @@ async function startWebSocketMonitor(input: {
   }
 
   const filter = {
-    address: USDT_ADDRESS,
+    address: input.tokenAddress,
     topics: [TRANSFER_TOPIC]
   };
 
   const attachSubscription = (activeProvider: WebSocketProvider) => {
-    console.log(`Subscribing once: ${input.symbol} Transfer events on ${USDT_ADDRESS}`);
+    console.log(`Subscribing once: ${input.symbol} Transfer events on ${input.tokenAddress}`);
     activeProvider.on(filter, (log: Log) => {
       void (async () => {
         const logKey = `${log.transactionHash}:${log.index}`;
@@ -1222,7 +1351,7 @@ async function startWebSocketMonitor(input: {
     provider = connected.provider;
     currentWsUrl = connected.wsUrl;
     attachSubscription(provider);
-    console.log(`Subscribed to USDT Transfer events over WebSocket: ${currentWsUrl}`);
+    console.log(`Subscribed to ${input.symbol} Transfer events over WebSocket: ${currentWsUrl}`);
   };
 
   await reconnect();
@@ -1264,7 +1393,7 @@ function startTelegramHealthUpdates(input: {
     lastHttpBlock = input.stats.lastHttpBlock;
 
     const message = [
-      "<b>ETH USDT Monitor Health</b>",
+      "<b>ETH USDT + USDC Monitor Health</b>",
       "",
       `<b>Window:</b> last ${Math.round(input.intervalMs / 60_000)} minute(s)`,
       `<b>Uptime:</b> ${uptimeMinutes} minute(s)`,
@@ -1798,6 +1927,7 @@ async function handleBlocksCommand(input: {
 
 async function fetchIndexedTransferAlerts(input: {
   indexedApi: IndexedApiConfig;
+  tokenAddress: string;
   wallets: WalletConfig[];
   walletByAddress: Map<string, WalletConfig>;
   fromBlock: number;
@@ -1819,7 +1949,7 @@ async function fetchIndexedTransferAlerts(input: {
     }
     url.searchParams.set("module", "account");
     url.searchParams.set("action", "tokentx");
-    url.searchParams.set("contractaddress", USDT_ADDRESS);
+    url.searchParams.set("contractaddress", input.tokenAddress);
     url.searchParams.set("address", wallet.address);
     url.searchParams.set("startblock", String(input.fromBlock));
     url.searchParams.set("endblock", String(input.toBlock));
@@ -1921,6 +2051,7 @@ async function sendRecentRealTransferAlerts(input: {
   if (input.indexedApi) {
     const alerts = await fetchIndexedTransferAlerts({
       indexedApi: input.indexedApi,
+      tokenAddress: USDT_ADDRESS,
       wallets: [...input.walletByAddress.values()],
       walletByAddress: input.walletByAddress,
       fromBlock: oldestBlock,
@@ -1971,6 +2102,7 @@ async function sendRecentRealTransferAlerts(input: {
         toBlock,
         input.walletTopics,
         {
+          tokenAddress: USDT_ADDRESS,
           incoming: input.alertIncoming,
           outgoing: input.alertOutgoing,
           timeoutMs: 15_000
@@ -2101,7 +2233,7 @@ async function fetchTransferLogs(
   fromBlock: number,
   toBlock: number,
   walletTopics: string[],
-  options: { incoming: boolean; outgoing: boolean; timeoutMs: number }
+  options: { tokenAddress: string; incoming: boolean; outgoing: boolean; timeoutMs: number }
 ): Promise<Log[]> {
   const queries: Array<() => Promise<Log[]>> = [];
 
@@ -2109,7 +2241,7 @@ async function fetchTransferLogs(
     if (options.incoming) {
       queries.push(
         () => provider.getLogs({
-          address: USDT_ADDRESS,
+          address: options.tokenAddress,
           fromBlock,
           toBlock,
           topics: [TRANSFER_TOPIC, null, walletTopic]
@@ -2120,7 +2252,7 @@ async function fetchTransferLogs(
     if (options.outgoing) {
       queries.push(
         () => provider.getLogs({
-          address: USDT_ADDRESS,
+          address: options.tokenAddress,
           fromBlock,
           toBlock,
           topics: [TRANSFER_TOPIC, walletTopic]
